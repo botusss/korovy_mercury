@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         korovy_mercuryvetrfru
 // @namespace    mercuryvetrfru
-// @version      0.1.1
+// @version      0.1.2
 // @description  Автоматический поиск и добавление животных из файла Excel в ИС Хорриот
 // @author       Vit O
 // @license      MIT
@@ -16,7 +16,10 @@
 (function () {
   'use strict';
   var CFG = { pauseMs: 2000, searchTimeoutMs: 60000, addTimeoutMs: 90000, maxPages: 100, pagePauseMs: 800 };
-  var state = { animals: [], log: [], running: false, stopRequested: false, index: 0, ok: 0, fail: 0, skip: 0, xlsxLoaded: false, minimized: false };
+  
+  // Читаем сохраненное состояние сворачивания из localStorage (по умолчанию false)
+  var isMinimizedStored = localStorage.getItem('haa_panel_minimized') === 'true';
+  var state = { animals: [], log: [], running: false, stopRequested: false, index: 0, ok: 0, fail: 0, skip: 0, xlsxLoaded: false, minimized: isMinimizedStored };
 
   // Автоматический перебор CDN для 100% надежной загрузки XLSX
   function loadXLSX() {
@@ -445,15 +448,15 @@
 
     var html = '';
     html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
-    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.1)</div>';
+    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.2)</div>';
     html += '<div style="display:flex;gap:4px;align-items:center;">';
-    html += '<button id="haa-toggle" type="button" title="Свернуть / Развернуть" style="background:#8a6d3b;color:#fff;border:none;border-radius:3px;width:18px;height:18px;font-size:10px;font-weight:bold;cursor:pointer;padding:0;line-height:1;">_</button>';
+    html += '<button id="haa-toggle" type="button" title="Свернуть / Развернуть" style="background:#8a6d3b;color:#fff;border:none;border-radius:3px;width:18px;height:18px;font-size:10px;font-weight:bold;cursor:pointer;padding:0;line-height:1;">' + (state.minimized ? '+' : '_') + '</button>';
     html += '<a href="https://vk.ru/osievich" target="_blank" title="Связаться с автором" style="display:inline-flex;justify-content:center;align-items:center;width:16px;height:16px;background:#8a6d3b;color:#fff;border-radius:50%;font-size:10px;font-weight:bold;text-decoration:none;">?</a>';
     html += '</div>';
     html += '</div>';
     
     // Контейнер для сворачиваемого контента
-    html += '<div id="haa-body-content">';
+    html += '<div id="haa-body-content" style="display:' + (state.minimized ? 'none' : 'block') + ';">';
     html += '<div style="margin-bottom:6px;font-size:11px;opacity:.85;">1-й лист: номер + кличка</div>';
     html += '<input id="haa-file" type="file" accept=".xlsx,.xls" style="width:100%;margin-bottom:6px;font-size:11px;">';
     html += '<label style="display:block;margin-bottom:6px;font-size:11px;">Пауза между поисками (мс)';
@@ -473,7 +476,9 @@
     panel.innerHTML = html;
 
     Object.assign(panel.style, {
-      position: 'fixed', top: '80px', right: '16px', width: '240px', zIndex: '999999',
+      position: 'fixed', top: '80px', right: '16px', 
+      width: (state.minimized ? '140px' : '240px'), 
+      zIndex: '999999',
       background: '#fffef8', border: '1px solid #8a6d3b', borderRadius: '6px',
       boxShadow: '0 4px 16px rgba(0,0,0,.15)', padding: '8px',
       fontFamily: 'Segoe UI, Tahoma, sans-serif', fontSize: '11px', color: '#222'
@@ -485,6 +490,9 @@
     document.getElementById('haa-toggle').addEventListener('click', function () {
       var content = document.getElementById('haa-body-content');
       state.minimized = !state.minimized;
+      // Сохраняем состояние в localStorage браузера
+      localStorage.setItem('haa_panel_minimized', state.minimized);
+
       if (state.minimized) {
         content.style.display = 'none';
         this.textContent = '+';
@@ -541,5 +549,5 @@
     getState: function () { return state; }
   };
 
-  console.log('%cХорриот←Excel (v0.1.1): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
+  console.log('%cХорриот←Excel (v0.1.2): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
 })();
