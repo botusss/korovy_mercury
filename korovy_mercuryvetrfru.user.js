@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         korovy_mercuryvetrfru
 // @namespace    mercuryvetrfru
-// @version      0.1
+// @version      0.1.1
 // @description  Автоматический поиск и добавление животных из файла Excel в ИС Хорриот
 // @author       Vit O
 // @license      MIT
@@ -12,12 +12,12 @@
 // @grant        none
 // @unwrap
 // ==/UserScript==
- 
+
 (function () {
   'use strict';
   var CFG = { pauseMs: 2000, searchTimeoutMs: 60000, addTimeoutMs: 90000, maxPages: 100, pagePauseMs: 800 };
-  var state = { animals: [], log: [], running: false, stopRequested: false, index: 0, ok: 0, fail: 0, skip: 0, xlsxLoaded: false };
- 
+  var state = { animals: [], log: [], running: false, stopRequested: false, index: 0, ok: 0, fail: 0, skip: 0, xlsxLoaded: false, minimized: false };
+
   // Автоматический перебор CDN для 100% надежной загрузки XLSX
   function loadXLSX() {
     return new Promise(function (resolve, reject) {
@@ -55,13 +55,13 @@
       tryNext();
     });
   }
- 
+
   function humanSleep(min, max) {
     if (max === undefined) { max = min * 1.25; min = min * 0.75; }
     var ms = Math.floor(Math.random() * (max - min + 1)) + min;
     return new Promise(function (resolve) { setTimeout(resolve, ms); });
   }
- 
+
   async function humanClick(el) {
     if (!el) return;
     if (el && el.jquery) el = el[0];
@@ -73,7 +73,7 @@
     el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
     el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
   }
- 
+
   async function humanType(input, text) {
     if (!input) return;
     input.focus();
@@ -93,11 +93,11 @@
     input.dispatchEvent(new Event('change', { bubbles: true }));
     input.blur();
   }
- 
+
   function norm(s) {
     return String(s == null ? '' : s).replace(/\u00a0/g, ' ').trim().toLowerCase().replace(/ё/g, 'е').replace(/\s+/g, ' ');
   }
- 
+
   function cellText(v) {
     if (v == null || v === '') return '';
     if (typeof v === 'number') {
@@ -106,7 +106,7 @@
     }
     return String(v).trim();
   }
- 
+
   function updateLiveLog(number, status) {
     var container = document.getElementById('haa-live-log');
     if (!container) return;
@@ -115,35 +115,35 @@
     if (status === 'Добавлено') color = '#2e7d32';
     else if (status.indexOf('Уже') !== -1 || status.indexOf('стоит') !== -1) color = '#e65100';
     else if (status.indexOf('Ошибка') !== -1 || status.indexOf('Не найдено') !== -1 || status.indexOf('Кличка не совпала') !== -1) color = '#c62828';
- 
+
     var div = document.createElement('div');
     div.style.color = color;
     div.style.marginBottom = '2px';
     div.textContent = '[' + timeStr + '] #' + number + ': ' + status;
- 
+
     container.appendChild(div);
     while (container.children.length > 15) {
       container.removeChild(container.firstChild);
     }
     container.scrollTop = container.scrollHeight;
   }
- 
+
   function logStatus(item, status, details) {
     state.log.push({ 'Внутрихозяйственный номер': item.number, 'Кличка (из Excel)': item.name, Статус: status, Детали: details || '', Время: new Date().toLocaleString('ru-RU') });
     updateLiveLog(item.number, status);
   }
- 
+
   function setStatus(text) {
     var el = document.getElementById('haa-status');
     if (el) el.textContent = text;
   }
- 
+
   function setProgress() {
     var el = document.getElementById('haa-progress');
     if (!el) return;
     el.textContent = 'Обработано: ' + state.index + ' / ' + state.animals.length + ' | ОК: ' + state.ok + ' | пропуск: ' + state.skip + ' | ошибки: ' + state.fail;
   }
- 
+
   async function parseExcel(file) {
     await loadXLSX();
     var buf = await file.arrayBuffer();
@@ -153,7 +153,7 @@
     var sheet = wb.Sheets[sheetName];
     var rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
     if (!rows.length) throw new Error('Первый лист пустой: ' + sheetName);
- 
+
     var animals = [];
     rows.forEach(function (row, i) {
       var number = cellText(row['Внутрихозяйственный номер']) || cellText(row['№']) || cellText(row['Номер']);
@@ -161,13 +161,13 @@
       if (!number) return;
       animals.push({ row: i + 2, number: number, name: name, sheet: sheetName });
     });
- 
+
     if (!animals.length) {
       throw new Error('На первом листе («' + sheetName + '») не найдено ни одной строки с внутрихозяйственным номером.');
     }
     return { sheetName: sheetName, animals: animals };
   }
- 
+
   function downloadLog() {
     if (typeof XLSX === 'undefined') { alert('Библиотека XLSX не доступна.'); return; }
     var rows = state.log.length ? state.log : [{ Статус: 'Лог пуст', Время: new Date().toLocaleString('ru-RU') }];
@@ -177,7 +177,7 @@
     var name = 'лог_хорриот_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.xlsx';
     XLSX.writeFile(wb, name);
   }
- 
+
   async function ensureDialogOpen() {
     if (typeof $ === 'undefined') throw new Error('jQuery не загружен на странице.');
     var dialog = document.getElementById('uan-search-dialog');
@@ -192,7 +192,7 @@
       return d && $(d).dialog('isOpen');
     }, 15000, 'Не открылся диалог Хорриот');
   }
- 
+
   function waitUntil(fn, timeoutMs, errMsg) {
     var start = Date.now();
     return new Promise(function (resolve, reject) {
@@ -203,7 +203,7 @@
       })();
     });
   }
- 
+
   function waitAjaxIdle(timeoutMs) {
     return waitUntil(function () {
       var isUpdating = (typeof IS_UPDATING !== 'undefined') ? IS_UPDATING : false;
@@ -211,7 +211,7 @@
       return !ajaxActive && !isUpdating;
     }, timeoutMs || CFG.searchTimeoutMs, 'Таймаут AJAX');
   }
- 
+
   async function clearFilters() {
     var ids = ['herriot-marking-number', 'herriot-number', 'herriot-name'];
     for (var i = 0; i < ids.length; i++) {
@@ -224,7 +224,7 @@
     if (typeof $ !== 'undefined') $('#herriot-type-filter input[type=radio]').prop('checked', false);
     await humanSleep(100, 300);
   }
- 
+
   async function searchByMarkingNumber(number) {
     await clearFilters();
     var input = document.getElementById('herriot-marking-number');
@@ -249,23 +249,23 @@
     await waitAjaxIdle(CFG.searchTimeoutMs);
     await humanSleep(300, 700);
   }
- 
+
   function getResultRows() {
     return Array.prototype.slice.call(document.querySelectorAll('#animalsFromHerriotAjaxList tr.herriot-result-row'));
   }
- 
+
   function rowNickname(tr) {
     var tds = tr.querySelectorAll('td');
     if (tds.length < 6) return '';
     return (tds[5].textContent || '').replace(/\s+/g, ' ').trim();
   }
- 
+
   function rowMarkingsText(tr) {
     var tds = tr.querySelectorAll('td');
     if (tds.length < 4) return '';
     return (tds[3].textContent || '').replace(/\s+/g, ' ').trim();
   }
- 
+
   function pickRow(rows, expectedName) {
     if (!rows.length) return { kind: 'not_found' };
     var want = norm(expectedName);
@@ -275,24 +275,24 @@
     var foundNames = rows.map(rowNickname).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
     return { kind: 'nickname_mismatch', foundNames: foundNames, sampleMarkings: rows.slice(0, 3).map(rowMarkingsText) };
   }
- 
+
   function getCurrentPageNumber() {
     var input = document.querySelector('#pageNavBlock input[name="pageList"]');
     if (!input) return 1;
     var n = parseInt(input.value, 10);
     return isNaN(n) || n < 1 ? 1 : n;
   }
- 
+
   function getNextPageButton() {
     return document.querySelector('#pageNavBlock button[title="перейти на следующую страницу"]');
   }
- 
+
   function canGoNextPage() {
     var btn = getNextPageButton();
     if (!btn || btn.disabled || btn.classList.contains('ui-state-disabled') || btn.classList.contains('ui-button-disabled')) return false;
     return true;
   }
- 
+
   async function goToNextResultsPage() {
     if (!canGoNextPage()) return false;
     var beforePage = getCurrentPageNumber();
@@ -310,11 +310,11 @@
     if (afterPage === beforePage && afterFirstId === beforeFirstId) return false;
     return true;
   }
- 
+
   function uniqPush(arr, values) {
     (values || []).forEach(function (v) { if (v && arr.indexOf(v) === -1) arr.push(v); });
   }
- 
+
   async function findAcrossAllPages(expectedName, onPage) {
     var allFoundNames = [], sampleMarkings = [], totalRows = 0, pagesChecked = 0;
     for (var p = 0; p < CFG.maxPages; p++) {
@@ -343,13 +343,13 @@
     if (!totalRows) return { kind: 'not_found', details: 'Поиск ничего не вернул', pagesChecked: pagesChecked };
     return { kind: 'nickname_mismatch', foundNames: allFoundNames, sampleMarkings: sampleMarkings.slice(0, 5), pagesChecked: pagesChecked };
   }
- 
+
   function isAlreadyInInventory(guid) {
     if (!guid) return false;
     if (typeof HERRIOT_ADDED !== 'undefined' && HERRIOT_ADDED[guid] === true) return true;
     return !!document.querySelector('#tbodyAnimalList tr[data-guid="' + guid + '"]');
   }
- 
+
   async function clickAddAndWait() {
     var btn = document.getElementById('herriot-search-btn');
     if (!btn) throw new Error('Не найдена кнопка «Добавить».');
@@ -365,7 +365,7 @@
       return closed || !!msg || afterCount > beforeCount;
     }, CFG.addTimeoutMs, 'Таймаут добавления животного').then(function () { return humanSleep(400, 800); });
   }
- 
+
   async function processOne(item) {
     await ensureDialogOpen();
     var keeping = document.getElementById('herriot-keeping-place-select');
@@ -398,7 +398,7 @@
     state.ok++;
     logStatus(item, 'Добавлено', detailsExtra.join('; '));
   }
- 
+
   async function run() {
     if (state.running) return;
     if (!state.animals.length) { alert('Сначала загрузите Excel.'); return; }
@@ -430,24 +430,30 @@
       updateButtons();
     }
   }
- 
+
   function updateButtons() {
     var start = document.getElementById('haa-start');
     var stop = document.getElementById('haa-stop');
     if (start) start.disabled = state.running || !state.animals.length;
     if (stop) stop.disabled = !state.running;
   }
- 
+
   function createUI() {
     if (document.getElementById('horriot-auto-add-panel')) return;
     var panel = document.createElement('div');
     panel.id = 'horriot-auto-add-panel';
- 
+
     var html = '';
     html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
-    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel</div>';
+    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.1)</div>';
+    html += '<div style="display:flex;gap:4px;align-items:center;">';
+    html += '<button id="haa-toggle" type="button" title="Свернуть / Развернуть" style="background:#8a6d3b;color:#fff;border:none;border-radius:3px;width:18px;height:18px;font-size:10px;font-weight:bold;cursor:pointer;padding:0;line-height:1;">_</button>';
     html += '<a href="https://vk.ru/osievich" target="_blank" title="Связаться с автором" style="display:inline-flex;justify-content:center;align-items:center;width:16px;height:16px;background:#8a6d3b;color:#fff;border-radius:50%;font-size:10px;font-weight:bold;text-decoration:none;">?</a>';
     html += '</div>';
+    html += '</div>';
+    
+    // Контейнер для сворачиваемого контента
+    html += '<div id="haa-body-content">';
     html += '<div style="margin-bottom:6px;font-size:11px;opacity:.85;">1-й лист: номер + кличка</div>';
     html += '<input id="haa-file" type="file" accept=".xlsx,.xls" style="width:100%;margin-bottom:6px;font-size:11px;">';
     html += '<label style="display:block;margin-bottom:6px;font-size:11px;">Пауза между поисками (мс)';
@@ -462,18 +468,34 @@
     html += '<div id="haa-status" style="font-size:11px;line-height:1.35;margin-bottom:6px;"></div>';
     html += '<div style="font-weight:600;font-size:10px;margin-bottom:2px;color:#555;">Живой лог (последние записи):</div>';
     html += '<div id="haa-live-log" style="height:110px;overflow-y:auto;background:#fff;border:1px solid #dcd6c8;padding:4px;font-size:10px;font-family:monospace;line-height:1.2;text-align:left;"></div>';
- 
+    html += '</div>'; // Конец сворачиваемого контента
+
     panel.innerHTML = html;
- 
+
     Object.assign(panel.style, {
       position: 'fixed', top: '80px', right: '16px', width: '240px', zIndex: '999999',
       background: '#fffef8', border: '1px solid #8a6d3b', borderRadius: '6px',
       boxShadow: '0 4px 16px rgba(0,0,0,.15)', padding: '8px',
       fontFamily: 'Segoe UI, Tahoma, sans-serif', fontSize: '11px', color: '#222'
     });
- 
+
     document.body.appendChild(panel);
- 
+
+    // Обработчик кнопки сворачивания/разворачивания
+    document.getElementById('haa-toggle').addEventListener('click', function () {
+      var content = document.getElementById('haa-body-content');
+      state.minimized = !state.minimized;
+      if (state.minimized) {
+        content.style.display = 'none';
+        this.textContent = '+';
+        panel.style.width = '140px';
+      } else {
+        content.style.display = 'block';
+        this.textContent = '_';
+        panel.style.width = '240px';
+      }
+    });
+
     document.getElementById('haa-file').addEventListener('change', function (e) {
       var file = e.target.files && e.target.files[0];
       if (!file) return;
@@ -491,25 +513,25 @@
         updateButtons();
       });
     });
- 
+
     document.getElementById('haa-start').addEventListener('click', function () { run(); updateButtons(); });
     document.getElementById('haa-stop').addEventListener('click', function () { state.stopRequested = true; setStatus('Останавливаю…'); });
     document.getElementById('haa-log').addEventListener('click', downloadLog);
- 
+
     updateButtons();
     setStatus('Загрузите Excel и нажмите Старт.');
   }
- 
+
   createUI();
   // Предзагрузка библиотеки в фоне при старте страницы
   loadXLSX().catch(function() {});
- 
+
   setInterval(function() {
     if (!document.getElementById('horriot-auto-add-panel') && document.body) {
       createUI();
     }
   }, 1000);
- 
+
   window.__horriotAutoAdd = {
     destroy: function () {
       state.stopRequested = true;
@@ -518,6 +540,6 @@
     },
     getState: function () { return state; }
   };
- 
-  console.log('%cХорриот←Excel: панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
+
+  console.log('%cХорриот←Excel (v0.1.1): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
 })();
