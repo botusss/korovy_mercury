@@ -6,6 +6,8 @@
 // @author       Vit O
 // @license      MIT
 // @match        https://mercury.vetrf.ru/gve/operatorui*
+// @updateURL    https://raw.githubusercontent.com/botusss/korovy_mercury/main/korovy_mercuryvetrfru.user.js
+// @downloadURL  https://raw.githubusercontent.com/botusss/korovy_mercury/main/korovy_mercuryvetrfru.user.js
 // @run-at       document-end
 // @grant        none
 // @unwrap
