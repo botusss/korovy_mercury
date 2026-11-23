@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         korovy_mercuryvetrfru
 // @namespace    mercuryvetrfru
-// @version      0.1.3
+// @version      0.1.4
 // @description  Автоматический поиск и добавление животных из файла Excel в ИС Хорриот
 // @author       Vit O
 // @license      MIT
@@ -436,7 +436,7 @@
 
     var html = '';
     html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
-    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.3)</div>';
+    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.4)</div>';
     html += '<div style="display:flex;gap:4px;align-items:center;">';
     html += '<button id="haa-toggle" type="button" title="Свернуть / Развернуть" style="background:#8a6d3b;color:#fff;border:none;border-radius:3px;width:18px;height:18px;font-size:10px;font-weight:bold;cursor:pointer;padding:0;line-height:1;">' + (state.minimized ? '+' : '_') + '</button>';
     html += '<a href="https://vk.ru/osievich" target="_blank" title="Связаться с автором" style="display:inline-flex;justify-content:center;align-items:center;width:16px;height:16px;background:#8a6d3b;color:#fff;border-radius:50%;font-size:10px;font-weight:bold;text-decoration:none;">?</a>';
