@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         korovy_mercuryvetrfru
 // @namespace    mercuryvetrfru
-// @version      0.1.4
+// @version      0.1.5
 // @description  Автоматический поиск и добавление животных из файла Excel в ИС Хорриот
 // @author       Vit O
 // @license      MIT
@@ -98,6 +98,54 @@
     return String(v).trim();
   }
 
+  function isRowCounterHeader(h) {
+    return /^(№\s*п\/п|п\/п|н\/п|порядковый\s*номер|строка)$/i.test(norm(h));
+  }
+
+  function findNumberColumn(headers) {
+    var exactPriority = [
+      'внутрихозяйственный номер',
+      'внутрихозяйственный №',
+      'внутрихозяйственный',
+      'инвентарный номер',
+      'инв. номер',
+      'инв. №',
+      'номер бирки',
+      '№ бирки',
+      'бирка',
+      'ушной номер',
+      'номер животного'
+    ];
+    var fallbackPriority = ['номер', '№'];
+
+    for (var p = 0; p < exactPriority.length; p++) {
+      var target = norm(exactPriority[p]);
+      for (var i = 0; i < headers.length; i++) {
+        var h = norm(headers[i]);
+        if (!h || isRowCounterHeader(h)) continue;
+        if (h === target) return i;
+      }
+    }
+
+    for (var f = 0; f < fallbackPriority.length; f++) {
+      var fb = norm(fallbackPriority[f]);
+      for (var j = 0; j < headers.length; j++) {
+        var hj = norm(headers[j]);
+        if (!hj || isRowCounterHeader(hj)) continue;
+        if (hj === fb) return j;
+      }
+    }
+
+    return -1;
+  }
+
+  function findNicknameColumn(headers) {
+    for (var i = 0; i < headers.length; i++) {
+      if (norm(headers[i]) === 'кличка') return i;
+    }
+    return -1;
+  }
+
   function updateLiveLog(number, status) {
     var container = document.getElementById('haa-live-log');
     if (!container) return;
@@ -142,16 +190,28 @@
     var wb = XLSX.read(buf, { type: 'array' });
     var sheetName = wb.SheetNames[0];
     var sheet = wb.Sheets[sheetName];
-    var rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: false });
-    if (!rows.length) throw new Error('Первый лист пустой: ' + sheetName);
+    var matrix = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '', raw: false });
+    if (!matrix || !matrix.length) throw new Error('Первый лист пустой: ' + sheetName);
+
+    var headers = matrix[0] || [];
+    var numberColIdx = findNumberColumn(headers);
+    var nicknameColIdx = findNicknameColumn(headers);
+
+    if (numberColIdx === -1) {
+      throw new Error('Не найден столбец с номером (ожидается "Внутрихозяйственный номер", "Бирка" и т.п., исключая "№ п/п").');
+    }
+    if (nicknameColIdx === -1) {
+      throw new Error('Не найден столбец "Кличка".');
+    }
 
     var animals = [];
-    rows.forEach(function (row, i) {
-      var number = cellText(row['Внутрихозяйственный номер']) || cellText(row['№']) || cellText(row['Номер']);
-      var name = cellText(row['Кличка']);
-      if (!number) return;
-      animals.push({ row: i + 2, number: number, name: name, sheet: sheetName });
-    });
+    for (var i = 1; i < matrix.length; i++) {
+      var row = matrix[i] || [];
+      var number = cellText(row[numberColIdx]);
+      var name = cellText(row[nicknameColIdx]);
+      if (!number) continue;
+      animals.push({ row: i + 1, number: number, name: name, sheet: sheetName });
+    }
 
     if (!animals.length) {
       throw new Error('На первом листе («' + sheetName + '») не найдено ни одной строки с внутрихозяйственным номером.');
@@ -216,18 +276,31 @@
     await humanSleep(100, 300);
   }
 
+  function getResultsSignature() {
+    var tb = document.getElementById('animalsFromHerriotAjaxList');
+    if (!tb) return '';
+    var rows = tb.querySelectorAll('tr.herriot-result-row');
+    var firstId = rows.length ? (rows[0].id || '') : '';
+    var lastId = rows.length ? (rows[rows.length - 1].id || '') : '';
+    var err = tb.querySelector('.errorMessage');
+    return rows.length + '|' + firstId + '|' + lastId + '|' + (err ? err.textContent.trim() : '');
+  }
+
   async function searchByMarkingNumber(number) {
     await clearFilters();
     var input = document.getElementById('herriot-marking-number');
     if (!input) throw new Error('Не найдено поле «Номера средств маркирования».');
     await humanType(input, number);
+    var beforeSignature = getResultsSignature();
+
     var searchBtn = document.getElementById('herriot-search-button') || document.getElementById('searchInHorriot') || document.getElementById('doSearch');
     if (!searchBtn) {
       var dialog = document.getElementById('uan-search-dialog');
       if (dialog) {
         var buttons = dialog.querySelectorAll('button');
         for (var i = 0; i < buttons.length; i++) {
-          if (buttons[i].textContent.trim().toLowerCase() === 'поиск' || buttons[i].textContent.trim().toLowerCase() === 'найти') {
+          var t = buttons[i].textContent.trim().toLowerCase();
+          if (t === 'поиск' || t === 'найти') {
             searchBtn = buttons[i];
             break;
           }
@@ -238,6 +311,9 @@
     if (!searchBtn) throw new Error('Не найдена кнопка поиска в диалоге Хорриот.');
     await humanClick(searchBtn);
     await waitAjaxIdle(CFG.searchTimeoutMs);
+    await waitUntil(function () {
+      return getResultsSignature() !== beforeSignature;
+    }, 5000, '').catch(function () {});
     await humanSleep(300, 700);
   }
 
@@ -247,24 +323,98 @@
 
   function rowNickname(tr) {
     var tds = tr.querySelectorAll('td');
-    if (tds.length < 6) return '';
-    return (tds[5].textContent || '').replace(/\s+/g, ' ').trim();
+    var candidates = [];
+    if (tds[4]) candidates.push((tds[4].textContent || '').replace(/\s+/g, ' ').trim());
+    if (tds[5]) candidates.push((tds[5].textContent || '').replace(/\s+/g, ' ').trim());
+
+    for (var i = 0; i < candidates.length; i++) {
+      var val = candidates[i];
+      if (!val) continue;
+      if (/^\d+\s*\/\s*\d+$/.test(val)) continue;
+      if (/^\d{2}\.\d{2}\.\d{4}$/.test(val)) continue;
+      return val;
+    }
+
+    var attrSource = tr.getAttribute('data-name') || tr.getAttribute('data-nickname') || tr.getAttribute('title') || '';
+    return attrSource.replace(/\s+/g, ' ').trim();
+  }
+
+  function rowMarkingsList(tr) {
+    var tds = tr.querySelectorAll('td');
+    if (tds.length < 3) return [];
+    var containers = tds[2].querySelectorAll('.marking-container');
+    if (!containers.length) {
+      var fallback = (tds[2].textContent || '').replace(/\s+/g, ' ').trim();
+      return fallback ? [fallback] : [];
+    }
+    var list = [];
+    for (var i = 0; i < containers.length; i++) {
+      var clone = containers[i].cloneNode(true);
+      var badges = clone.querySelectorAll('.herriot-marking-type');
+      for (var b = 0; b < badges.length; b++) badges[b].remove();
+      var val = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+      if (val) list.push(val);
+    }
+    return list;
+  }
+
+  function rowHasMarking(tr, targetNumber) {
+    var wantNum = norm(targetNumber);
+    if (!wantNum) return true;
+    var marks = rowMarkingsList(tr);
+    for (var i = 0; i < marks.length; i++) {
+      if (norm(marks[i]) === wantNum) return true;
+    }
+    return false;
   }
 
   function rowMarkingsText(tr) {
     var tds = tr.querySelectorAll('td');
-    if (tds.length < 4) return '';
-    return (tds[3].textContent || '').replace(/\s+/g, ' ').trim();
+    if (tds.length < 3) return '';
+    return (tds[2].textContent || '').replace(/\s+/g, ' ').trim();
   }
 
-  function pickRow(rows, expectedName) {
+  function pickRow(rows, expectedName, expectedNumber) {
     if (!rows.length) return { kind: 'not_found' };
+    var exactNumRows = expectedNumber ? rows.filter(function (tr) { return rowHasMarking(tr, expectedNumber); }) : [];
+    var pool = exactNumRows.length ? exactNumRows : rows;
     var want = norm(expectedName);
-    var matched = rows.filter(function (tr) { return want && norm(rowNickname(tr)) === want; });
-    if (matched.length) return { kind: 'ok', row: matched[0], foundName: rowNickname(matched[0]), multi: matched.length > 1 };
-    if (!want) return { kind: 'ok', row: rows[0], foundName: rowNickname(rows[0]), multi: rows.length > 1, warn: 'Кличка в Excel пустая — выбрана первая строка' };
-    var foundNames = rows.map(rowNickname).filter(Boolean).filter(function (v, i, a) { return a.indexOf(v) === i; });
-    return { kind: 'nickname_mismatch', foundNames: foundNames, sampleMarkings: rows.slice(0, 3).map(rowMarkingsText) };
+
+    var matched = pool.filter(function (tr) {
+      var nick = norm(rowNickname(tr));
+      return want && nick && nick === want;
+    });
+    if (matched.length) {
+      // Всегда берем первую подходящую строку при наличии дублей
+      return {
+        kind: 'ok',
+        row: matched[0],
+        foundName: rowNickname(matched[0]),
+        multi: matched.length > 1,
+        warn: !exactNumRows.length && expectedNumber ? 'точное совпадение бирки не найдено — проверено по выдаче' : ''
+      };
+    }
+
+    if (!want) {
+      return {
+        kind: 'ok',
+        row: pool[0],
+        foundName: rowNickname(pool[0]),
+        multi: pool.length > 1,
+        warn: 'Кличка в Excel пустая — выбрана первая строка'
+      };
+    }
+
+    var foundNames = pool
+      .map(rowNickname)
+      .filter(Boolean)
+      .filter(function (v, i, a) { return a.indexOf(v) === i; });
+
+    return {
+      kind: 'nickname_mismatch',
+      foundNames: foundNames,
+      sampleMarkings: pool.slice(0, 3).map(rowMarkingsText)
+    };
   }
 
   function getCurrentPageNumber() {
@@ -274,31 +424,55 @@
     return isNaN(n) || n < 1 ? 1 : n;
   }
 
+  function getLastPageNumber() {
+    var input = document.querySelector('#pageNavBlock input[name="lastPage"]');
+    if (!input) return 1;
+    var n = parseInt(input.value, 10);
+    return isNaN(n) || n < 1 ? 1 : n;
+  }
+
+  function isButtonEnabled(btn) {
+    if (!btn) return false;
+    if (btn.disabled) return false;
+    if (btn.classList.contains('ui-state-disabled') || btn.classList.contains('ui-button-disabled')) return false;
+    return true;
+  }
+
   function getNextPageButton() {
-    return document.querySelector('#pageNavBlock button[title="перейти на следующую страницу"]');
+    var byTitle = document.querySelector('#pageNavBlock button[title*="следующую страницу" i]');
+    if (byTitle) return byTitle;
+    var buttons = document.querySelectorAll('#pageNavBlock .pagenav.buttonset button');
+    for (var i = 0; i < buttons.length; i++) {
+      var icon = buttons[i].querySelector('.fa-angle-right');
+      if (icon && !buttons[i].querySelector('.fa-angle-double-right')) return buttons[i];
+    }
+    return null;
   }
 
   function canGoNextPage() {
+    var cur = getCurrentPageNumber();
+    var last = getLastPageNumber();
+    if (cur >= last) return false;
     var btn = getNextPageButton();
-    if (!btn || btn.disabled || btn.classList.contains('ui-state-disabled') || btn.classList.contains('ui-button-disabled')) return false;
-    return true;
+    return isButtonEnabled(btn);
   }
 
   async function goToNextResultsPage() {
     if (!canGoNextPage()) return false;
     var beforePage = getCurrentPageNumber();
-    var beforeFirstId = '';
-    var firstRow = document.querySelector('#animalsFromHerriotAjaxList tr.herriot-result-row');
-    if (firstRow) beforeFirstId = firstRow.id || '';
+    var beforeSig = getResultsSignature();
     var btn = getNextPageButton();
     await humanClick(btn);
     await waitAjaxIdle(CFG.searchTimeoutMs);
+    await waitUntil(function () {
+      var afterPage = getCurrentPageNumber();
+      var afterSig = getResultsSignature();
+      return afterPage !== beforePage || afterSig !== beforeSig;
+    }, 6000, '').catch(function () {});
     await humanSleep(CFG.pagePauseMs, CFG.pagePauseMs * 1.5);
     var afterPage = getCurrentPageNumber();
-    var afterFirstId = '';
-    var afterRow = document.querySelector('#animalsFromHerriotAjaxList tr.herriot-result-row');
-    if (afterRow) afterFirstId = afterRow.id || '';
-    if (afterPage === beforePage && afterFirstId === beforeFirstId) return false;
+    var afterSig = getResultsSignature();
+    if (afterPage === beforePage && afterSig === beforeSig) return false;
     return true;
   }
 
@@ -306,7 +480,7 @@
     (values || []).forEach(function (v) { if (v && arr.indexOf(v) === -1) arr.push(v); });
   }
 
-  async function findAcrossAllPages(expectedName, onPage) {
+  async function findAcrossAllPages(expectedName, expectedNumber, onPage) {
     var allFoundNames = [], sampleMarkings = [], totalRows = 0, pagesChecked = 0;
     for (var p = 0; p < CFG.maxPages; p++) {
       if (state.stopRequested) return { kind: 'stopped', pagesChecked: pagesChecked };
@@ -317,7 +491,7 @@
       totalRows += rows.length;
       var emptyMsg = document.querySelector('#animalsFromHerriotAjaxList .errorMessage');
       if (emptyMsg && !rows.length && pagesChecked === 1) return { kind: 'not_found', details: emptyMsg.textContent.trim() || 'Нет данных', pagesChecked: pagesChecked };
-      var pick = pickRow(rows, expectedName);
+      var pick = pickRow(rows, expectedName, expectedNumber);
       if (pick.kind === 'ok') {
         pick.pagesChecked = pagesChecked;
         pick.pageNo = pageNo;
@@ -362,7 +536,7 @@
     var keeping = document.getElementById('herriot-keeping-place-select');
     if (keeping && (keeping.value === 'null' || !keeping.value)) throw new Error('Не выбрано место содержания в диалоге Хорриот.');
     await searchByMarkingNumber(item.number);
-    var pick = await findAcrossAllPages(item.name, function (pageNo, pagesChecked) {
+    var pick = await findAcrossAllPages(item.name, item.number, function (pageNo, pagesChecked) {
       setStatus('Ищу: ' + item.number + ' / ' + (item.name || '—') + ' (стр. ' + pageNo + ', просмотрено: ' + pagesChecked + ')');
     });
     if (pick.kind === 'stopped') { state.skip++; logStatus(item, 'Остановлено', 'Остановка во время просмотра страниц'); return; }
@@ -436,7 +610,7 @@
 
     var html = '';
     html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
-    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.4)</div>';
+    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.5)</div>';
     html += '<div style="display:flex;gap:4px;align-items:center;">';
     html += '<button id="haa-toggle" type="button" title="Свернуть / Развернуть" style="background:#8a6d3b;color:#fff;border:none;border-radius:3px;width:18px;height:18px;font-size:10px;font-weight:bold;cursor:pointer;padding:0;line-height:1;">' + (state.minimized ? '+' : '_') + '</button>';
     html += '<a href="https://vk.ru/osievich" target="_blank" title="Связаться с автором" style="display:inline-flex;justify-content:center;align-items:center;width:16px;height:16px;background:#8a6d3b;color:#fff;border-radius:50%;font-size:10px;font-weight:bold;text-decoration:none;">?</a>';
@@ -535,7 +709,7 @@
     getState: function () { return state; }
   };
 
-  console.log('%cХорриот←Excel (v0.1.3): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
+  console.log('%cХорриот←Excel (v0.1.4): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
 
   function injectBundledXLSX(window) {
 /*! xlsx.js (C) 2013-present SheetJS -- http://sheetjs.com */
