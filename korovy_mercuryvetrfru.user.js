@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         korovy_mercuryvetrfru
 // @namespace    mercuryvetrfru
-// @version      0.1.5
-// @description  Автоматический поиск и добавление животных из файла Excel в ИС Хорриот
+// @version      0.2.0
+// @description  Автоматический поиск и добавление животных из файла Excel в ИС Меркурий
 // @author       Vit O
 // @license      MIT
 // @match        https://mercury.vetrf.ru/gve/operatorui*
@@ -15,13 +15,351 @@
 
 (function () {
   'use strict';
-  var CFG = { pauseMs: 2000, searchTimeoutMs: 60000, addTimeoutMs: 90000, maxPages: 100, pagePauseMs: 800 };
+  var CFG = {
+    pauseMs: 2000,
+    autoSaveEvery: 0,
+    searchTimeoutMs: 60000,
+    addTimeoutMs: 90000,
+    saveTimeoutMs: 45000,
+    maxPages: 100,
+    pagePauseMs: 800,
+    maxReturnAttempts: 10,
+    returnDelayMs: 3500,
+    returnDelayStepMs: 700,
+    returnMaxAgeMs: 30 * 60 * 1000,
+    operatorUiPath: '/gve/operatorui',
+    returnStorageKey: 'haa_return_pending_v1',
+    noticeUrl: 'https://gist.githubusercontent.com/botusss/e00872cc7cf13b9bae098ec643b61aa8/raw/notice.json',
+    noticeCacheKey: 'haa_notice_cache_v1',
+    sessionKeyPrefix: 'haa_session_v1_',
+    autosaveStorageKey: 'haa_autosave_every_v1',
+    pauseStorageKey: 'haa_pause_ms_v1'
+  };
 
-  // Читаем сохраненное состояние сворачивания из localStorage (по умолчанию false)
   var isMinimizedStored = localStorage.getItem('haa_panel_minimized') === 'true';
-  var state = { animals: [], log: [], running: false, stopRequested: false, index: 0, ok: 0, fail: 0, skip: 0, xlsxLoaded: false, minimized: isMinimizedStored };
+  var state = {
+    animals: [],
+    log: [],
+    running: false,
+    stopRequested: false,
+    index: 0,
+    ok: 0,
+    fail: 0,
+    skip: 0,
+    xlsxLoaded: false,
+    minimized: isMinimizedStored,
+    sourceUrl: window.location.href,
+    notice: null,
+    selectedKeepingPlace: null
+  };
 
-  // Инициализация встроенной библиотеки XLSX без обращения к внешним CDN
+  function isOnOperatorUi() {
+    return window.location.href.indexOf(CFG.operatorUiPath) !== -1 ||
+      window.location.pathname.indexOf(CFG.operatorUiPath) !== -1;
+  }
+
+  function readSavedPauseMs(fallback) {
+    try {
+      var raw = localStorage.getItem(CFG.pauseStorageKey);
+      if (raw === null || raw === '') return fallback;
+      var num = Number(raw);
+      if (isNaN(num) || num < 500) return fallback;
+      return Math.round(num);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function writeSavedPauseMs(val) {
+    try {
+      localStorage.setItem(CFG.pauseStorageKey, String(val));
+    } catch (e) {}
+  }
+
+  function readSavedAutoSaveEvery(fallback) {
+    try {
+      var raw = localStorage.getItem(CFG.autosaveStorageKey);
+      if (raw === null || raw === '') return fallback;
+      var num = Number(raw);
+      if (isNaN(num) || num < 0) return fallback;
+      return Math.floor(num);
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function writeSavedAutoSaveEvery(val) {
+    try {
+      localStorage.setItem(CFG.autosaveStorageKey, String(val));
+    } catch (e) {}
+  }
+
+  function getLayoutMetrics() {
+    var availW = (window.screen && window.screen.availWidth) || window.innerWidth || 1366;
+    var scale = availW >= 1920 ? 1.2 : (availW >= 1440 ? 1.08 : 1.0);
+    var expandedWidth = Math.max(240, Math.min(360, Math.round(availW * 0.165)));
+    var minimizedWidth = Math.max(140, Math.min(200, Math.round(expandedWidth * 0.6)));
+    var liveLogHeight = Math.round(110 * scale);
+    var fontSize = Math.round(11 * scale);
+    return {
+      expandedWidth: expandedWidth,
+      minimizedWidth: minimizedWidth,
+      liveLogHeight: liveLogHeight,
+      fontSize: fontSize
+    };
+  }
+
+  function getSessionKeyForUrl(urlStr) {
+    var target = urlStr || window.location.href;
+    var base = window.location.origin + window.location.pathname;
+    try {
+      var u = new URL(target, window.location.origin);
+      base = u.origin + u.pathname;
+      var docId = u.searchParams.get('vetDocument') || u.searchParams.get('id') || u.searchParams.get('documentId') || u.searchParams.get('uuid') || '';
+      if (docId) base += '?doc=' + docId;
+    } catch (e) {}
+    return CFG.sessionKeyPrefix + encodeURIComponent(base);
+  }
+
+  function getSessionKey() {
+    return getSessionKeyForUrl(state.sourceUrl || window.location.href);
+  }
+
+  function loadReturnRecord() {
+    try {
+      var raw = localStorage.getItem(CFG.returnStorageKey);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || !parsed.pendingAction || !Array.isArray(parsed.animals)) return null;
+      if (parsed.savedAt && (Date.now() - parsed.savedAt > CFG.returnMaxAgeMs)) {
+        localStorage.removeItem(CFG.returnStorageKey);
+        return null;
+      }
+      parsed._storageKey = CFG.returnStorageKey;
+      parsed._isReturnRecord = true;
+      return parsed;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveReturnRecord(payload) {
+    try {
+      var currentPlace = readCurrentKeepingPlace();
+      if (currentPlace) state.selectedKeepingPlace = currentPlace;
+
+      var record = Object.assign({
+        savedAt: Date.now(),
+        sourceUrl: state.sourceUrl || window.location.href,
+        animals: state.animals,
+        log: state.log,
+        index: state.index,
+        ok: state.ok,
+        fail: state.fail,
+        skip: state.skip,
+        pauseMs: CFG.pauseMs,
+        autoSaveEvery: CFG.autoSaveEvery,
+        selectedKeepingPlace: state.selectedKeepingPlace,
+        pendingAction: null
+      }, payload || {});
+      localStorage.setItem(CFG.returnStorageKey, JSON.stringify(record));
+    } catch (e) {
+      console.warn('Не удалось сохранить состояние возврата:', e);
+    }
+  }
+
+  function clearReturnRecord() {
+    try {
+      localStorage.removeItem(CFG.returnStorageKey);
+    } catch (e) {}
+  }
+
+  function getKeepingSelectElement() {
+    return document.getElementById('herriot-keeping-place-select');
+  }
+
+  function isKeepingPlaceSelected() {
+    var keeping = getKeepingSelectElement();
+    if (!keeping) return false;
+    var val = String(keeping.value || '').trim();
+    return val !== '' && val !== 'null' && val !== '0' && val !== '-1';
+  }
+
+  function readCurrentKeepingPlace() {
+    var keeping = getKeepingSelectElement();
+    if (!keeping || !isKeepingPlaceSelected()) return null;
+    var opt = keeping.options && keeping.selectedIndex >= 0 ? keeping.options[keeping.selectedIndex] : null;
+    return {
+      value: String(keeping.value).trim(),
+      text: opt ? String(opt.textContent || '').replace(/\s+/g, ' ').trim() : ''
+    };
+  }
+
+  async function tryRestoreKeepingPlace(savedPlace) {
+    if (!savedPlace || (!savedPlace.value && !savedPlace.text)) return isKeepingPlaceSelected();
+    var keeping = getKeepingSelectElement();
+    if (!keeping || !keeping.options) return false;
+
+    var matchedValue = '';
+    for (var i = 0; i < keeping.options.length; i++) {
+      var opt = keeping.options[i];
+      var optVal = String(opt.value || '').trim();
+      var optText = String(opt.textContent || '').replace(/\s+/g, ' ').trim();
+      if (savedPlace.value && optVal === savedPlace.value) {
+        matchedValue = optVal;
+        break;
+      }
+      if (!matchedValue && savedPlace.text && optText === savedPlace.text && optVal && optVal !== 'null' && optVal !== '0' && optVal !== '-1') {
+        matchedValue = optVal;
+      }
+    }
+
+    if (!matchedValue) return false;
+
+    keeping.value = matchedValue;
+    keeping.dispatchEvent(new Event('change', { bubbles: true }));
+    if (typeof $ !== 'undefined') $(keeping).trigger('change');
+    await waitAjaxIdle(CFG.searchTimeoutMs).catch(function () {});
+    await humanSleep(250, 450);
+    return isKeepingPlaceSelected();
+  }
+
+  function saveSessionToStorage(extra, explicitKey) {
+    try {
+      var currentPlace = readCurrentKeepingPlace();
+      if (currentPlace) state.selectedKeepingPlace = currentPlace;
+
+      var targetKey = explicitKey || getSessionKey();
+      var payload = Object.assign({
+        savedAt: Date.now(),
+        sourceUrl: state.sourceUrl || window.location.href,
+        animals: state.animals,
+        log: state.log,
+        index: state.index,
+        ok: state.ok,
+        fail: state.fail,
+        skip: state.skip,
+        pauseMs: CFG.pauseMs,
+        autoSaveEvery: CFG.autoSaveEvery,
+        selectedKeepingPlace: state.selectedKeepingPlace,
+        pendingAction: null
+      }, extra || {});
+
+      if (!isOnOperatorUi() || targetKey === CFG.returnStorageKey) {
+        localStorage.setItem(targetKey, JSON.stringify(payload));
+      }
+      if (payload.pendingAction) {
+        localStorage.setItem(CFG.returnStorageKey, JSON.stringify(payload));
+      }
+    } catch (e) {
+      console.warn('Не удалось сохранить состояние в localStorage:', e);
+    }
+  }
+
+  function loadSessionFromStorage() {
+    var ret = loadReturnRecord();
+    if (ret) return ret;
+
+    if (isOnOperatorUi()) {
+      return null;
+    }
+
+    try {
+      var key = getSessionKey();
+      var raw = localStorage.getItem(key);
+      if (!raw) return null;
+      var parsed = JSON.parse(raw);
+      if (!parsed || !Array.isArray(parsed.animals)) return null;
+      parsed._storageKey = key;
+      return parsed;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function clearSessionFromStorage(explicitKey) {
+    try {
+      if (explicitKey) {
+        localStorage.removeItem(explicitKey);
+      } else {
+        localStorage.removeItem(getSessionKey());
+        localStorage.removeItem(getSessionKeyForUrl(window.location.href));
+      }
+      clearReturnRecord();
+    } catch (e) {}
+  }
+
+  function normalizeNoticeData(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    var message = typeof raw.message === 'string' ? raw.message.trim() : '';
+    if (!message) return null;
+    var levelRaw = typeof raw.level === 'string' ? raw.level.trim().toLowerCase() : 'info';
+    var level = (levelRaw === 'warn' || levelRaw === 'alert' || levelRaw === 'info') ? levelRaw : 'info';
+    return { level: level, message: message };
+  }
+
+  function renderNotice(notice) {
+    state.notice = normalizeNoticeData(notice);
+    var box = document.getElementById('haa-notice-box');
+    if (!box) return;
+    if (!state.notice) {
+      box.style.display = 'none';
+      box.textContent = '';
+      return;
+    }
+
+    var palette = {
+      info: { bg: '#eef4fa', border: '#6b9ac4', text: '#1d3b57' },
+      warn: { bg: '#fff8db', border: '#d4a017', text: '#5c4300' },
+      alert: { bg: '#fdecea', border: '#c62828', text: '#7f1212' }
+    };
+    var theme = palette[state.notice.level] || palette.info;
+
+    box.style.display = 'block';
+    box.style.background = theme.bg;
+    box.style.borderColor = theme.border;
+    box.style.color = theme.text;
+    box.textContent = state.notice.message;
+  }
+
+  function loadCachedNotice() {
+    try {
+      var cachedRaw = localStorage.getItem(CFG.noticeCacheKey);
+      if (!cachedRaw) return null;
+      var cached = JSON.parse(cachedRaw);
+      return normalizeNoticeData(cached && cached.notice ? cached.notice : cached);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async function refreshNotice() {
+    var cached = loadCachedNotice();
+    if (cached && !state.notice) renderNotice(cached);
+
+    try {
+      var sep = CFG.noticeUrl.indexOf('?') === -1 ? '?' : '&';
+      var resp = await fetch(CFG.noticeUrl + sep + '_t=' + Date.now(), { cache: 'no-store' });
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      var json = await resp.json();
+      var normalized = normalizeNoticeData(json);
+      if (normalized) {
+        try {
+          localStorage.setItem(CFG.noticeCacheKey, JSON.stringify({ updatedAt: Date.now(), notice: normalized }));
+        } catch (e) {}
+        renderNotice(normalized);
+      } else {
+        renderNotice(null);
+      }
+    } catch (e) {
+      if (cached) {
+        renderNotice(cached);
+      } else {
+        renderNotice(null);
+      }
+    }
+  }
+
   function loadXLSX() {
     return new Promise(function (resolve, reject) {
       try {
@@ -151,20 +489,43 @@
     if (!container) return;
     var timeStr = new Date().toLocaleTimeString('ru-RU');
     var color = '#333';
+    var isBold = false;
     if (status === 'Добавлено') color = '#2e7d32';
     else if (status.indexOf('Уже') !== -1 || status.indexOf('стоит') !== -1) color = '#e65100';
-    else if (status.indexOf('Ошибка') !== -1 || status.indexOf('Не найдено') !== -1 || status.indexOf('Кличка не совпала') !== -1) color = '#c62828';
+    else if (
+      status.indexOf('ХОЗЯЙСТВО НЕ ВЫБРАНО') !== -1 ||
+      status.indexOf('Ошибка') !== -1 ||
+      status.indexOf('Не найдено') !== -1 ||
+      status.indexOf('Кличка не совпала') !== -1
+    ) {
+      color = '#c62828';
+      if (status.indexOf('ХОЗЯЙСТВО НЕ ВЫБРАНО') !== -1) isBold = true;
+    }
 
     var div = document.createElement('div');
     div.style.color = color;
+    if (isBold) div.style.fontWeight = '700';
     div.style.marginBottom = '2px';
-    div.textContent = '[' + timeStr + '] #' + number + ': ' + status;
+    div.textContent = '[' + timeStr + '] ' + (number ? '#' + number + ': ' : '') + status;
 
     container.appendChild(div);
     while (container.children.length > 15) {
       container.removeChild(container.firstChild);
     }
     container.scrollTop = container.scrollHeight;
+  }
+
+  function rebuildLiveLogFromState() {
+    var container = document.getElementById('haa-live-log');
+    if (!container) return;
+    container.innerHTML = '';
+    var tail = state.log.slice(-15);
+    for (var i = 0; i < tail.length; i++) {
+      var row = tail[i];
+      var num = row['Внутрихозяйственный номер'] || '—';
+      var st = row['Статус'] || '';
+      updateLiveLog(num, st);
+    }
   }
 
   function logStatus(item, status, details) {
@@ -229,6 +590,75 @@
     XLSX.writeFile(wb, name);
   }
 
+  function isButtonEnabled(btn) {
+    if (!btn) return false;
+    if (btn.disabled) return false;
+    if (btn.classList.contains('ui-state-disabled') || btn.classList.contains('ui-button-disabled')) return false;
+    return true;
+  }
+
+  function findSaveButton() {
+    var buttons = Array.prototype.slice.call(document.querySelectorAll('button.positive, button'));
+    for (var i = 0; i < buttons.length; i++) {
+      var btn = buttons[i];
+      if (!isButtonEnabled(btn)) continue;
+      var text = (btn.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      var hasTick = !!btn.querySelector('img[src*="/buttons/tick.gif"]');
+      var hasSubmitFn = String(btn.getAttribute('onclick') || '').indexOf('submitVetDocument') !== -1;
+      if (text === 'сохранить' && (hasTick || hasSubmitFn || btn.classList.contains('positive'))) {
+        return btn;
+      }
+    }
+    return null;
+  }
+
+  function canOpenHorriotDialog() {
+    var dialog = document.getElementById('uan-search-dialog');
+    var link = document.querySelector('a.herriot-add.animal-list-action-link');
+    return !!(dialog || link);
+  }
+
+  function computeReturnDelay(attemptNumber) {
+    var idx = Math.max(0, Number(attemptNumber || 1) - 1);
+    return CFG.returnDelayMs + idx * CFG.returnDelayStepMs;
+  }
+
+  function navigateToStartUrl(targetUrl) {
+    if (!targetUrl) return;
+    try {
+      window.location.assign(targetUrl);
+    } catch (e) {
+      window.location.href = targetUrl;
+    }
+  }
+
+  async function triggerSaveAndRedirect(mode) {
+    var btn = findSaveButton();
+    if (!btn) throw new Error('Не найдена нижняя кнопка «Сохранить».');
+
+    var startHref = state.sourceUrl || window.location.href;
+    var place = readCurrentKeepingPlace() || state.selectedKeepingPlace;
+    if (place) state.selectedKeepingPlace = place;
+
+    saveReturnRecord({
+      sourceUrl: startHref,
+      selectedKeepingPlace: place || null,
+      pendingAction: {
+        mode: mode || 'checkpoint',
+        returnUrl: startHref,
+        returnAttempts: 0,
+        triggeredAt: Date.now()
+      }
+    });
+
+    await humanClick(btn);
+
+    return waitUntil(function () {
+      return document.readyState === 'complete' &&
+        (window.location.href !== startHref || isOnOperatorUi());
+    }, CFG.saveTimeoutMs, 'Таймаут перехода после нажатия «Сохранить»');
+  }
+
   async function ensureDialogOpen() {
     if (typeof $ === 'undefined') throw new Error('jQuery не загружен на странице.');
     var dialog = document.getElementById('uan-search-dialog');
@@ -263,6 +693,29 @@
     }, timeoutMs || CFG.searchTimeoutMs, 'Таймаут AJAX');
   }
 
+  async function waitTableSettled(beforeSig, timeoutMs) {
+    await waitUntil(function () {
+      return getResultsSignature() !== beforeSig;
+    }, timeoutMs || 6000, '').catch(function () {});
+
+    var stableSig = getResultsSignature();
+    var stableTicks = 0;
+    var start = Date.now();
+    while (Date.now() - start < 2500) {
+      await humanSleep(180, 240);
+      var isUpdating = (typeof IS_UPDATING !== 'undefined') ? IS_UPDATING : false;
+      var ajaxActive = window.ajaxVetcontrol && window.ajaxVetcontrol.active > 0;
+      var curSig = getResultsSignature();
+      if (!isUpdating && !ajaxActive && curSig === stableSig) {
+        stableTicks++;
+        if (stableTicks >= 2) break;
+      } else {
+        stableSig = curSig;
+        stableTicks = 0;
+      }
+    }
+  }
+
   async function clearFilters() {
     var ids = ['herriot-marking-number', 'herriot-number', 'herriot-name'];
     for (var i = 0; i < ids.length; i++) {
@@ -276,14 +729,33 @@
     await humanSleep(100, 300);
   }
 
+  function compactRowText(tr) {
+    if (!tr) return '';
+    return (tr.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  }
+
   function getResultsSignature() {
     var tb = document.getElementById('animalsFromHerriotAjaxList');
     if (!tb) return '';
     var rows = tb.querySelectorAll('tr.herriot-result-row');
-    var firstId = rows.length ? (rows[0].id || '') : '';
-    var lastId = rows.length ? (rows[rows.length - 1].id || '') : '';
+    var first = rows.length ? rows[0] : null;
+    var last = rows.length ? rows[rows.length - 1] : null;
+    var firstId = first ? (first.id || '') : '';
+    var lastId = last ? (last.id || '') : '';
+    var firstText = compactRowText(first);
+    var lastText = compactRowText(last);
+    var pageNo = getCurrentPageNumber();
+    var lastPage = getLastPageNumber();
     var err = tb.querySelector('.errorMessage');
-    return rows.length + '|' + firstId + '|' + lastId + '|' + (err ? err.textContent.trim() : '');
+    return [
+      rows.length,
+      pageNo + '/' + lastPage,
+      firstId,
+      lastId,
+      firstText,
+      lastText,
+      err ? err.textContent.trim() : ''
+    ].join('|');
   }
 
   async function searchByMarkingNumber(number) {
@@ -311,9 +783,7 @@
     if (!searchBtn) throw new Error('Не найдена кнопка поиска в диалоге Хорриот.');
     await humanClick(searchBtn);
     await waitAjaxIdle(CFG.searchTimeoutMs);
-    await waitUntil(function () {
-      return getResultsSignature() !== beforeSignature;
-    }, 5000, '').catch(function () {});
+    await waitTableSettled(beforeSignature, 5000);
     await humanSleep(300, 700);
   }
 
@@ -385,7 +855,6 @@
       return want && nick && nick === want;
     });
     if (matched.length) {
-      // Всегда берем первую подходящую строку при наличии дублей
       return {
         kind: 'ok',
         row: matched[0],
@@ -431,13 +900,6 @@
     return isNaN(n) || n < 1 ? 1 : n;
   }
 
-  function isButtonEnabled(btn) {
-    if (!btn) return false;
-    if (btn.disabled) return false;
-    if (btn.classList.contains('ui-state-disabled') || btn.classList.contains('ui-button-disabled')) return false;
-    return true;
-  }
-
   function getNextPageButton() {
     var byTitle = document.querySelector('#pageNavBlock button[title*="следующую страницу" i]');
     if (byTitle) return byTitle;
@@ -464,11 +926,7 @@
     var btn = getNextPageButton();
     await humanClick(btn);
     await waitAjaxIdle(CFG.searchTimeoutMs);
-    await waitUntil(function () {
-      var afterPage = getCurrentPageNumber();
-      var afterSig = getResultsSignature();
-      return afterPage !== beforePage || afterSig !== beforeSig;
-    }, 6000, '').catch(function () {});
+    await waitTableSettled(beforeSig, 6000);
     await humanSleep(CFG.pagePauseMs, CFG.pagePauseMs * 1.5);
     var afterPage = getCurrentPageNumber();
     var afterSig = getResultsSignature();
@@ -533,8 +991,7 @@
 
   async function processOne(item) {
     await ensureDialogOpen();
-    var keeping = document.getElementById('herriot-keeping-place-select');
-    if (keeping && (keeping.value === 'null' || !keeping.value)) throw new Error('Не выбрано место содержания в диалоге Хорриот.');
+    if (!isKeepingPlaceSelected()) throw new Error('ХОЗЯЙСТВО НЕ ВЫБРАНО');
     await searchByMarkingNumber(item.number);
     var pick = await findAcrossAllPages(item.name, item.number, function (pageNo, pagesChecked) {
       setStatus('Ищу: ' + item.number + ' / ' + (item.name || '—') + ' (стр. ' + pageNo + ', просмотрено: ' + pagesChecked + ')');
@@ -564,32 +1021,130 @@
     logStatus(item, 'Добавлено', detailsExtra.join('; '));
   }
 
-  async function run() {
+  function readControlsToConfig() {
+    var pauseInput = document.getElementById('haa-pause');
+    var saveEveryInput = document.getElementById('haa-autosave-every');
+    var rawPause = pauseInput ? Number(pauseInput.value) : CFG.pauseMs;
+    var rawEvery = saveEveryInput ? Number(saveEveryInput.value) : CFG.autoSaveEvery;
+    CFG.pauseMs = Math.max(500, isNaN(rawPause) ? 2000 : Math.round(rawPause));
+    CFG.autoSaveEvery = Math.max(0, isNaN(rawEvery) ? 0 : Math.floor(rawEvery));
+    if (pauseInput) pauseInput.value = CFG.pauseMs;
+    if (saveEveryInput) saveEveryInput.value = CFG.autoSaveEvery;
+    writeSavedPauseMs(CFG.pauseMs);
+    writeSavedAutoSaveEvery(CFG.autoSaveEvery);
+  }
+
+  async function run(options) {
     if (state.running) return;
     if (!state.animals.length) { alert('Сначала загрузите Excel.'); return; }
-    state.running = true; state.stopRequested = false; state.index = 0; state.ok = 0; state.fail = 0; state.skip = 0; state.log = [];
-    var liveLogEl = document.getElementById('haa-live-log');
-    if (liveLogEl) liveLogEl.innerHTML = '';
-    setProgress(); setStatus('Работаю…');
-    var pauseInput = document.getElementById('haa-pause');
-    CFG.pauseMs = Math.max(500, Number(pauseInput && pauseInput.value) || 2000);
+    var resuming = !!(options && options.resume);
+    var keepProgress = resuming || (state.index > 0 && state.index < state.animals.length);
+
+    state.running = true;
+    state.stopRequested = false;
+    if (!isOnOperatorUi()) {
+      state.sourceUrl = window.location.href;
+    }
+
+    if (!keepProgress) {
+      state.index = 0;
+      state.ok = 0;
+      state.fail = 0;
+      state.skip = 0;
+      state.log = [];
+      var liveLogEl = document.getElementById('haa-live-log');
+      if (liveLogEl) liveLogEl.innerHTML = '';
+    } else {
+      rebuildLiveLogFromState();
+    }
+
+    updateButtons();
+    setProgress();
+    setStatus(resuming ? 'Продолжаю после сохранения…' : 'Проверяю диалог и хозяйство…');
+    readControlsToConfig();
+
+    var processedSinceSave = 0;
+
     try {
-      for (var i = 0; i < state.animals.length; i++) {
-        if (state.stopRequested) { setStatus('Остановлено пользователем.'); break; }
-        state.index = i; setProgress();
+      await ensureDialogOpen();
+
+      if (!isKeepingPlaceSelected() && state.selectedKeepingPlace) {
+        setStatus('Выбираю хозяйство: ' + (state.selectedKeepingPlace.text || state.selectedKeepingPlace.value) + '…');
+        await tryRestoreKeepingPlace(state.selectedKeepingPlace);
+      }
+
+      if (!isKeepingPlaceSelected()) {
+        updateLiveLog('', 'ХОЗЯЙСТВО НЕ ВЫБРАНО');
+        setStatus('ХОЗЯЙСТВО НЕ ВЫБРАНО. Выберите хозяйство и нажмите Старт.');
+        saveSessionToStorage({ pendingAction: null });
+        return;
+      }
+
+      state.selectedKeepingPlace = readCurrentKeepingPlace();
+      saveSessionToStorage({ pendingAction: null });
+
+      for (var i = state.index; i < state.animals.length; i++) {
+        if (state.stopRequested) {
+          saveSessionToStorage({ pendingAction: null });
+          setStatus('Остановлено пользователем.');
+          break;
+        }
+        state.index = i;
+        setProgress();
         var item = state.animals[i];
         setStatus('Ищу: ' + item.number + ' / ' + (item.name || '—'));
-        try { await processOne(item); } catch (e) { state.fail++; logStatus(item, 'Ошибка', (e && e.message) || String(e)); console.error(e); }
-        state.index = i + 1; setProgress();
+        try {
+          await processOne(item);
+        } catch (e) {
+          if (e && e.message === 'ХОЗЯЙСТВО НЕ ВЫБРАНО') {
+            updateLiveLog('', 'ХОЗЯЙСТВО НЕ ВЫБРАНО');
+            setStatus('ХОЗЯЙСТВО НЕ ВЫБРАНО. Выберите хозяйство и нажмите Старт.');
+            saveSessionToStorage({ pendingAction: null });
+            return;
+          }
+          state.fail++;
+          logStatus(item, 'Ошибка', (e && e.message) || String(e));
+          console.error(e);
+        }
+        state.index = i + 1;
+        processedSinceSave++;
+        setProgress();
+        saveSessionToStorage({ pendingAction: null });
+
+        if (!state.stopRequested && CFG.autoSaveEvery > 0 && processedSinceSave >= CFG.autoSaveEvery && i < state.animals.length - 1) {
+          processedSinceSave = 0;
+          setStatus('Автосохранение (' + state.index + ' / ' + state.animals.length + ')…');
+          await triggerSaveAndRedirect('checkpoint');
+          return;
+        }
+
         if (i < state.animals.length - 1 && !state.stopRequested) {
           var currentPause = Math.floor(CFG.pauseMs * (0.8 + Math.random() * 0.4));
           setStatus('Пауза ' + currentPause + ' мс…');
           await humanSleep(currentPause, currentPause);
         }
       }
-      if (!state.stopRequested) setStatus('Готово. Скачиваю лог…');
+
+      if (state.stopRequested) {
+        downloadLog();
+        setStatus('Остановлено. Лог скачан. ОК: ' + state.ok + ', пропуск: ' + state.skip + ', ошибки: ' + state.fail);
+        return;
+      }
+
+      if (findSaveButton()) {
+        setStatus('Завершаю: нажимаю «Сохранить»…');
+        await triggerSaveAndRedirect('final');
+        return;
+      }
+
+      clearSessionFromStorage();
+      setStatus('Готово. Скачиваю лог…');
       downloadLog();
-      setStatus((state.stopRequested ? 'Остановлено. ' : 'Готово. ') + 'Лог скачан. ОК: ' + state.ok + ', пропуск: ' + state.skip + ', ошибки: ' + state.fail);
+      setStatus('Готово. Лог скачан. ОК: ' + state.ok + ', пропуск: ' + state.skip + ', ошибки: ' + state.fail);
+    } catch (e) {
+      saveSessionToStorage({ pendingAction: null });
+      setStatus('Ошибка: ' + ((e && e.message) || String(e)));
+      console.error(e);
     } finally {
       state.running = false;
       updateButtons();
@@ -605,76 +1160,125 @@
 
   function createUI() {
     if (document.getElementById('horriot-auto-add-panel')) return;
+    CFG.pauseMs = readSavedPauseMs(CFG.pauseMs);
+    CFG.autoSaveEvery = readSavedAutoSaveEvery(CFG.autoSaveEvery);
+
+    var metrics = getLayoutMetrics();
+    var noticeMaxHeight = Math.round(metrics.fontSize * 1.35 * 3 + 10);
     var panel = document.createElement('div');
     panel.id = 'horriot-auto-add-panel';
 
     var html = '';
     html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">';
-    html += '<div style="font-weight:700;font-size:12px;">Хорриот ← Excel (v0.1.5)</div>';
+    html += '<div style="font-weight:700;font-size:' + (metrics.fontSize + 1) + 'px;">Меркурий ← Excel (v0.2.0)</div>';
     html += '<div style="display:flex;gap:4px;align-items:center;">';
     html += '<button id="haa-toggle" type="button" title="Свернуть / Развернуть" style="background:#8a6d3b;color:#fff;border:none;border-radius:3px;width:18px;height:18px;font-size:10px;font-weight:bold;cursor:pointer;padding:0;line-height:1;">' + (state.minimized ? '+' : '_') + '</button>';
-    html += '<a href="https://vk.ru/osievich" target="_blank" title="Связаться с автором" style="display:inline-flex;justify-content:center;align-items:center;width:16px;height:16px;background:#8a6d3b;color:#fff;border-radius:50%;font-size:10px;font-weight:bold;text-decoration:none;">?</a>';
+    html += '<a href="https://vk.me/osievich" target="_blank" title="Связаться с автором" style="display:inline-flex;justify-content:center;align-items:center;width:16px;height:16px;background:#8a6d3b;color:#fff;border-radius:50%;font-size:10px;font-weight:bold;text-decoration:none;">?</a>';
     html += '</div>';
     html += '</div>';
 
-    // Контейнер для сворачиваемого контента
     html += '<div id="haa-body-content" style="display:' + (state.minimized ? 'none' : 'block') + ';">';
-    html += '<div style="margin-bottom:6px;font-size:11px;opacity:.85;">1-й лист: номер + кличка</div>';
-    html += '<input id="haa-file" type="file" accept=".xlsx,.xls" style="width:100%;margin-bottom:6px;font-size:11px;">';
-    html += '<label style="display:block;margin-bottom:6px;font-size:11px;">Пауза между поисками (мс)';
-    html += '<input id="haa-pause" type="number" min="500" step="100" value="2000" style="width:100%;margin-top:2px;box-sizing:border-box;font-size:11px;padding:2px;"></label>';
-    html += '<div id="haa-file-info" style="font-size:11px;margin-bottom:6px;color:#1b5e20;"></div>';
-    html += '<div style="display:flex;gap:4px;margin-bottom:6px;">';
-    html += '<button id="haa-start" type="button" style="flex:1;padding:4px;font-size:11px;">Старт</button>';
-    html += '<button id="haa-stop" type="button" style="flex:1;padding:4px;font-size:11px;" disabled>Стоп</button>';
+    html += '<div id="haa-notice-box" style="display:none;margin-bottom:6px;padding:5px 6px;max-height:' + noticeMaxHeight + 'px;overflow-y:auto;box-sizing:border-box;border:1px solid #6b9ac4;border-radius:4px;font-size:' + metrics.fontSize + 'px;line-height:1.35;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;"></div>';
+    html += '<div style="margin-bottom:6px;font-size:' + metrics.fontSize + 'px;opacity:.85;">1-й лист: номер + кличка</div>';
+    html += '<input id="haa-file" type="file" accept=".xlsx,.xls" style="width:100%;margin-bottom:6px;font-size:' + metrics.fontSize + 'px;">';
+
+    html += '<div style="display:flex;gap:6px;margin-bottom:6px;">';
+    html += '<label style="flex:1;display:block;font-size:' + metrics.fontSize + 'px;">Пауза (мс)';
+    html += '<input id="haa-pause" type="number" min="500" step="100" value="' + CFG.pauseMs + '" style="width:100%;margin-top:2px;box-sizing:border-box;font-size:' + metrics.fontSize + 'px;padding:2px;"></label>';
+    html += '<label style="flex:1;display:block;font-size:' + metrics.fontSize + 'px;">Автосохр. (шт)';
+    html += '<input id="haa-autosave-every" type="number" min="0" step="1" value="' + CFG.autoSaveEvery + '" title="0 — выключено" style="width:100%;margin-top:2px;box-sizing:border-box;font-size:' + metrics.fontSize + 'px;padding:2px;"></label>';
     html += '</div>';
-    html += '<button id="haa-log" type="button" style="width:100%;padding:4px;margin-bottom:6px;font-size:11px;">Скачать лог</button>';
-    html += '<div id="haa-progress" style="font-size:11px;margin-bottom:4px;"></div>';
-    html += '<div id="haa-status" style="font-size:11px;line-height:1.35;margin-bottom:6px;"></div>';
-    html += '<div style="font-weight:600;font-size:10px;margin-bottom:2px;color:#555;">Живой лог (последние записи):</div>';
-    html += '<div id="haa-live-log" style="height:110px;overflow-y:auto;background:#fff;border:1px solid #dcd6c8;padding:4px;font-size:10px;font-family:monospace;line-height:1.2;text-align:left;"></div>';
-    html += '</div>'; // Конец сворачиваемого контента
+
+    html += '<div id="haa-file-info" style="font-size:' + metrics.fontSize + 'px;margin-bottom:6px;color:#1b5e20;"></div>';
+    html += '<div style="display:flex;gap:4px;margin-bottom:6px;">';
+    html += '<button id="haa-start" type="button" style="flex:1;padding:4px;font-size:' + metrics.fontSize + 'px;">Старт</button>';
+    html += '<button id="haa-stop" type="button" style="flex:1;padding:4px;font-size:' + metrics.fontSize + 'px;" disabled>Стоп</button>';
+    html += '</div>';
+    html += '<button id="haa-log" type="button" style="width:100%;padding:4px;margin-bottom:6px;font-size:' + metrics.fontSize + 'px;">Скачать лог</button>';
+    html += '<div id="haa-progress" style="font-size:' + metrics.fontSize + 'px;margin-bottom:4px;"></div>';
+    html += '<div id="haa-status" style="font-size:' + metrics.fontSize + 'px;line-height:1.35;margin-bottom:6px;"></div>';
+    html += '<div style="font-weight:600;font-size:' + Math.max(10, metrics.fontSize - 1) + 'px;margin-bottom:2px;color:#555;">Живой лог (последние записи):</div>';
+    html += '<div id="haa-live-log" style="height:' + metrics.liveLogHeight + 'px;overflow-y:auto;background:#fff;border:1px solid #dcd6c8;padding:4px;font-size:' + Math.max(10, metrics.fontSize - 1) + 'px;font-family:monospace;line-height:1.25;text-align:left;"></div>';
+    html += '</div>';
 
     panel.innerHTML = html;
 
     Object.assign(panel.style, {
-      position: 'fixed', top: '80px', right: '16px',
-      width: (state.minimized ? '140px' : '240px'),
+      position: 'fixed',
+      top: '80px',
+      right: '16px',
+      width: (state.minimized ? metrics.minimizedWidth : metrics.expandedWidth) + 'px',
       zIndex: '999999',
-      background: '#fffef8', border: '1px solid #8a6d3b', borderRadius: '6px',
-      boxShadow: '0 4px 16px rgba(0,0,0,.15)', padding: '8px',
-      fontFamily: 'Segoe UI, Tahoma, sans-serif', fontSize: '11px', color: '#222'
+      background: '#fffef8',
+      border: '1px solid #8a6d3b',
+      borderRadius: '6px',
+      boxShadow: '0 4px 16px rgba(0,0,0,.15)',
+      padding: '8px',
+      fontFamily: 'Segoe UI, Tahoma, sans-serif',
+      fontSize: metrics.fontSize + 'px',
+      color: '#222'
     });
 
     document.body.appendChild(panel);
 
-    // Обработчик кнопки сворачивания/разворачивания
     document.getElementById('haa-toggle').addEventListener('click', function () {
       var content = document.getElementById('haa-body-content');
       state.minimized = !state.minimized;
-      localStorage.setItem('haa_panel_minimized', state.minimized);
+      localStorage.setItem('haa_panel_minimized', String(state.minimized));
 
       if (state.minimized) {
         content.style.display = 'none';
         this.textContent = '+';
-        panel.style.width = '140px';
+        panel.style.width = metrics.minimizedWidth + 'px';
       } else {
         content.style.display = 'block';
         this.textContent = '_';
-        panel.style.width = '240px';
+        panel.style.width = metrics.expandedWidth + 'px';
       }
     });
+
+    var pauseInput = document.getElementById('haa-pause');
+    if (pauseInput) {
+      pauseInput.addEventListener('change', function () {
+        var raw = Number(this.value);
+        var val = Math.max(500, isNaN(raw) ? 2000 : Math.round(raw));
+        this.value = val;
+        CFG.pauseMs = val;
+        writeSavedPauseMs(val);
+      });
+    }
+
+    var saveEveryInput = document.getElementById('haa-autosave-every');
+    if (saveEveryInput) {
+      saveEveryInput.addEventListener('change', function () {
+        var raw = Number(this.value);
+        var val = Math.max(0, isNaN(raw) ? 0 : Math.floor(raw));
+        this.value = val;
+        CFG.autoSaveEvery = val;
+        writeSavedAutoSaveEvery(val);
+      });
+    }
 
     document.getElementById('haa-file').addEventListener('change', function (e) {
       var file = e.target.files && e.target.files[0];
       if (!file) return;
+      clearSessionFromStorage();
       setStatus('Инициализация XLSX и чтение Excel…');
       parseExcel(file).then(function (res) {
         state.animals = res.animals;
+        state.index = 0;
+        state.ok = 0;
+        state.fail = 0;
+        state.skip = 0;
+        state.log = [];
+        state.sourceUrl = window.location.href;
+        var liveLogEl = document.getElementById('haa-live-log');
+        if (liveLogEl) liveLogEl.innerHTML = '';
         document.getElementById('haa-file-info').textContent = 'Лист «' + res.sheetName + '»: ' + res.animals.length + ' жив.';
         setStatus('Файл загружен. Старт.');
         setProgress();
         updateButtons();
+        saveSessionToStorage({ pendingAction: null });
       }).catch(function (err) {
         state.animals = [];
         document.getElementById('haa-file-info').textContent = '';
@@ -683,20 +1287,138 @@
       });
     });
 
-    document.getElementById('haa-start').addEventListener('click', function () { run(); updateButtons(); });
-    document.getElementById('haa-stop').addEventListener('click', function () { state.stopRequested = true; setStatus('Останавливаю…'); });
+    document.getElementById('haa-start').addEventListener('click', function () {
+      refreshNotice().catch(function () {});
+      run({ resume: false });
+      updateButtons();
+    });
+
+    document.getElementById('haa-stop').addEventListener('click', function () {
+      state.stopRequested = true;
+      setStatus('Останавливаю…');
+      refreshNotice().catch(function () {});
+    });
+
     document.getElementById('haa-log').addEventListener('click', downloadLog);
 
+    if (state.notice) renderNotice(state.notice);
     updateButtons();
     setStatus('Загрузите Excel и нажмите Старт.');
   }
 
+  function restoreAndHandlePendingSession() {
+    var saved = loadSessionFromStorage();
+    if (!saved) return;
+
+    var sessionKey = saved._storageKey || getSessionKey();
+    state.animals = saved.animals || [];
+    state.log = saved.log || [];
+    state.index = saved.index || 0;
+    state.ok = saved.ok || 0;
+    state.fail = saved.fail || 0;
+    state.skip = saved.skip || 0;
+    state.sourceUrl = (saved.pendingAction && saved.pendingAction.returnUrl) || saved.sourceUrl || window.location.href;
+    state.selectedKeepingPlace = saved.selectedKeepingPlace || null;
+
+    CFG.pauseMs = readSavedPauseMs(saved.pauseMs || CFG.pauseMs);
+    CFG.autoSaveEvery = readSavedAutoSaveEvery(typeof saved.autoSaveEvery === 'number' ? saved.autoSaveEvery : CFG.autoSaveEvery);
+
+    var pauseEl = document.getElementById('haa-pause');
+    if (pauseEl) pauseEl.value = CFG.pauseMs;
+    var saveEveryEl = document.getElementById('haa-autosave-every');
+    if (saveEveryEl) saveEveryEl.value = CFG.autoSaveEvery;
+
+    var infoEl = document.getElementById('haa-file-info');
+    if (infoEl && state.animals.length) {
+      var sheetTitle = state.animals[0].sheet || 'Excel';
+      infoEl.textContent = 'Лист «' + sheetTitle + '»: ' + state.animals.length + ' жив. (восст.)';
+    }
+
+    rebuildLiveLogFromState();
+    setProgress();
+    updateButtons();
+
+    var pending = saved.pendingAction;
+    if (pending && pending.mode === 'final') {
+      clearSessionFromStorage(sessionKey);
+      loadXLSX().then(function () {
+        downloadLog();
+        setStatus('Готово (после сохранения). Лог скачан. ОК: ' + state.ok + ', пропуск: ' + state.skip + ', ошибки: ' + state.fail);
+      }).catch(function () {
+        setStatus('Готово (после сохранения). ОК: ' + state.ok + ', пропуск: ' + state.skip + ', ошибки: ' + state.fail);
+      });
+      return;
+    }
+
+    if (pending && pending.mode === 'checkpoint' && state.animals.length > 0 && state.index < state.animals.length) {
+      var targetUrl = pending.returnUrl || state.sourceUrl;
+      var attempts = Number(pending.returnAttempts || 0);
+
+      if (!canOpenHorriotDialog()) {
+        if (!targetUrl) {
+          clearReturnRecord();
+          setStatus('Сохранено (' + state.index + ' / ' + state.animals.length + '). Не указан стартовый URL — откройте форму и нажмите Старт.');
+          return;
+        }
+
+        if (attempts >= CFG.maxReturnAttempts) {
+          clearReturnRecord();
+          setStatus('Сохранено (' + state.index + ' / ' + state.animals.length + '). Не удалось вернуться за ' + CFG.maxReturnAttempts + ' попыток — откройте форму и нажмите Старт.');
+          return;
+        }
+
+        var nextAttempt = attempts + 1;
+        var delayMs = computeReturnDelay(nextAttempt);
+        saveReturnRecord({
+          sourceUrl: targetUrl,
+          pendingAction: Object.assign({}, pending, {
+            returnUrl: targetUrl,
+            returnAttempts: nextAttempt,
+            lastAttemptAt: Date.now()
+          })
+        });
+
+        var reasonText = isOnOperatorUi() ? 'Попали на operatorui, ' : '';
+        setStatus(reasonText + 'возвращаюсь на стартовую страницу (' + nextAttempt + '/' + CFG.maxReturnAttempts + ', пауза ' + (delayMs / 1000).toFixed(1) + 'с)…');
+
+        setTimeout(function () {
+          navigateToStartUrl(targetUrl);
+        }, delayMs);
+        return;
+      }
+
+      clearReturnRecord();
+      saveSessionToStorage({
+        sourceUrl: targetUrl,
+        pendingAction: null
+      }, getSessionKeyForUrl(targetUrl));
+
+      setTimeout(function () {
+        run({ resume: true });
+      }, 600);
+      return;
+    }
+
+    if (state.animals.length > 0 && state.index < state.animals.length) {
+      setStatus('Восстановлено (' + state.index + ' / ' + state.animals.length + '). Нажмите Старт.');
+    }
+  }
+
   createUI();
+  restoreAndHandlePendingSession();
+  refreshNotice().catch(function () {});
   loadXLSX().catch(function () {});
 
   setInterval(function () {
     if (!document.getElementById('horriot-auto-add-panel') && document.body) {
       createUI();
+      if (state.animals.length) {
+        var infoEl = document.getElementById('haa-file-info');
+        if (infoEl) infoEl.textContent = 'Лист «' + (state.animals[0].sheet || 'Excel') + '»: ' + state.animals.length + ' жив.';
+        rebuildLiveLogFromState();
+        setProgress();
+        updateButtons();
+      }
     }
   }, 1000);
 
@@ -709,7 +1431,7 @@
     getState: function () { return state; }
   };
 
-  console.log('%cХорриот←Excel (v0.1.4): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
+  console.log('%cМеркурий←Excel (v0.2.0): панель справа. Загрузите xlsx и нажмите Старт.', 'color:#1b5e20;font-weight:bold;');
 
   function injectBundledXLSX(window) {
 /*! xlsx.js (C) 2013-present SheetJS -- http://sheetjs.com */
